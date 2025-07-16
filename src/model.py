@@ -258,12 +258,18 @@ class HybridBlip2Flamingo(nn.Module):
         logits = self.language_blip2.lm_head(hidden)
 
         ## loss calculation using CrossEntropy
-        loss = None
         if labels is not None:
             lab = self.processor(labels, padding=True, return_tensors="pt").input_ids.to(device)
-            shift_logits = logits[:, -lab.size(1):]
+
+            # Ensure logits and labels are the same length
+            logits = logits[:, -lab.size(1):, :]  # truncate any excess tokens
+
+            # Shift for CLM: predict token t+1 using token t
+            shift_logits = logits[:, :-1, :].contiguous()
+            shift_labels = lab[:, 1:].contiguous()
+
             loss = nn.CrossEntropyLoss(ignore_index=self.processor.tokenizer.pad_token_id)(
-                shift_logits.reshape(-1, shift_logits.size(-1)), lab.reshape(-1)
+                shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1)
             )
 
         return {"logits": logits, "loss": loss}
