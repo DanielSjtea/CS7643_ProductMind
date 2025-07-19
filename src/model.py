@@ -261,10 +261,10 @@ class HybridBlip2Flamingo(nn.Module):
         if labels is not None:
             lab = self.processor(labels, padding=True, return_tensors="pt").input_ids.to(device)
 
-            # Ensure logits and labels are the same length
-            logits = logits[:, -lab.size(1):, :]  # truncate any excess tokens
+            ## Ensure logits and labels are the same length
+            logits = logits[:, -lab.size(1):, :]  ## truncate any excess tokens
 
-            # Shift for CLM: predict token t+1 using token t
+            ## Shift for Causal Language Modelling: predict token t+1 using token t
             shift_logits = logits[:, :-1, :].contiguous()
             shift_labels = lab[:, 1:].contiguous()
 
@@ -284,20 +284,15 @@ class HybridBlip2Flamingo(nn.Module):
         **generate_kwargs,
     ) -> list[str]:
         """
-        BLIP‑2‑style conditional generation with Flamingo cross‑attention.
+        Function to generate text output
 
-        Args:
-            images: Either a tensor (B,3,H,W) **already** on the target device or a
-                    list/tuple of PIL images.
-            prompts: A single string or a list of length B. Empty string == “caption”.
-            max_new_tokens: Same meaning as in HF `generate`.
-            temperature: Passed straight to HF `generate` (works with sampling).
-            **generate_kwargs: Anything else accepted by `OPTForCausalLM.generate`
-                            (e.g. top_k, top_p, num_beams, repetition_penalty …).
+        :param images: either a tensor (B,3,H,W) already on the target device or a list of PIL images.
+        :param prompts: a single string or a list of length B. Empty string == “caption”.
+        :param max_new_tokens: maximum number of new tokens
+        :param temperature: passed directly to BLIP-2 OPT generate
+        :param **generate_kwargs: anything else accepted by `OPTForCausalLM.generate` (e.g. top_k, top_p, num_beams, etc)
 
-        Returns:
-            A `list[str]` of length `batch_size`, *only* the text generated after the
-            user prompt.
+        :output: a list[str] of length B, with only the text generated after the user prompt.
         """
         device = next(self.parameters()).device
         if "prompt" in generate_kwargs:
@@ -306,72 +301,57 @@ class HybridBlip2Flamingo(nn.Module):
             prompts = [prompts]
 
         # ---------------
-        # 1) IMAGE → PREFIX
+        # 1) IMAGE -> PREFIX (IMG ENCODINGS)
         # ---------------
-        # Vision encoder
-        image_feats = self._encode_image(images)                                # (B, Sv, d_img)
+        ## Vision encoder
+        image_feats = self._encode_image(images) ## (B, Sv, d_img)
         B, _, d_img = image_feats.shape
 
-        # Q‑Former (frozen, fp32) → down‑cast back to fp16
-        q_tokens = self.blip2_query_tokens.expand(B, -1, -1)                    # (B, Q, d_img)
+        ## Q‑Former (frozen, fp32) → down‑cast back to fp16
+        q_tokens = self.blip2_query_tokens.expand(B, -1, -1) ## (B, Q, d_img)
         q_out = self.qformer_blip2(
             query_embeds=q_tokens,
             encoder_hidden_states=image_feats,
             return_dict=True,
         ).last_hidden_state.to(dtype=torch.float16)
 
-        img_prefix = self.language_proj_blip2(q_out)                            # (B, Q, d_model)
+        img_prefix = self.language_proj_blip2(q_out) ## (B, Q, d_model)
 
-        # Perceiver‑Resampler → visual tokens used inside cross‑att blocks.
-        # We *cache* them so that every forward inside HF decoding sees the
-        # same `v_tokens` without recomputing.
-        self._cached_v_tokens = self.v_proj(self.perceiver_resampler(image_feats))  # (B, L, d_model)
+        # Visual tokens used inside cross‑attn blocks.
+        # Cache them so that every forward inside HF decoding sees the same visual tokens without recomputing.
+        self._cached_v_tokens = self.v_proj(self.perceiver_resampler(image_feats)) ## (B, L, d_model)
         # Inject v_tokens into decoder cross-attn blocks
         for i in self.cross_idx:
             self.cross_attn_blocks[str(i)].v_tokens = self._cached_v_tokens
 
         # ---------------
-        # 2) TEXT PROMPT → TOKENS
+        # 2) TEXT PROMPT -> TOKENS
         # ---------------
         tok_out = self.processor.tokenizer(
             prompts, padding=True, return_tensors="pt"
         ).to(device)
-        input_ids = tok_out.input_ids                                           # (B, T)
-        attn_mask = tok_out.attention_mask                                      # (B, T)
+        input_ids = tok_out.input_ids ## (B, T)
+        attn_mask = tok_out.attention_mask ## (B, T)
 
-        # Word embeddings (OPT): (B,T,d_model)
+        ## Word embeddings (OPT): (B, T, d_model)
         txt_embeds = self.language_blip2.model.decoder.embed_tokens(input_ids)
 
-        # Add learned positional embeddings
+        ## Add learned positional embeddings
         pos_ids = torch.arange(txt_embeds.size(1), device=device).unsqueeze(0)
         txt_embeds = txt_embeds + self.language_blip2.model.decoder.embed_positions(
             attn_mask, position_ids=pos_ids
         )
 
         # ---------------
-        # 3) CONCAT prefix + prompt   →   inputs_embeds / attention_mask
+        # 3) CONCAT prefix + prompt   ->   inputs_embeds / attention_mask
         # ---------------
-        inputs_embeds = torch.cat([img_prefix, txt_embeds], dim=1)              # (B, Q+T, d)
+        inputs_embeds = torch.cat([img_prefix, txt_embeds], dim=1) ## (B, Q+T, d)
         prefix_mask   = torch.ones(B, img_prefix.size(1), dtype=attn_mask.dtype, device=device)
-        attention_mask = torch.cat([prefix_mask, attn_mask], dim=1)             # (B, Q+T)
+        attention_mask = torch.cat([prefix_mask, attn_mask], dim=1) ## (B, Q+T)
 
         # ---------------
-        # 4) HF GENERATE (OPT)
+        # 4) HuggingFace GENERATE (LLM: OPT)
         # ---------------
-        # NB: Because our Flamingo cross‑attn blocks sit *outside* the wrapped
-        # OPT model, we expose them via a tiny wrapper that simply calls the
-        # normal OPT decoder layer *then* injects cross‑attention.  That wrapper
-        # is already what `forward()` does, so `prepare_inputs_for_generation`
-        # just needs to re‑route `inputs_embeds` through *this* module.
-        #
-        # Easiest: register ourselves as the generation model temporarily.
-        #
-        # -> call self.language_blip2.generate with `inputs_embeds` **but**
-        #    override `forward` & `prepare_inputs_for_generation` through
-        #    `patch_generate_forward()`.  For clarity (and less metaprogramming)
-        #    we instead wrap everything in our own loop based on
-        #    `torch.utils.checkpoint` and incremental kv‑cache — that is quite
-        #    verbose, so below we stick to the pragmatic approach:
         outputs = self.language_blip2.generate(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
@@ -380,24 +360,24 @@ class HybridBlip2Flamingo(nn.Module):
             pad_token_id=self.processor.tokenizer.pad_token_id,
             eos_token_id=self.processor.tokenizer.eos_token_id,
             **generate_kwargs,
-        )                                                                       # (B, Q+T+new)
+        ) ## (B, Q + T + new)
 
         # ---------------
         # 5) POST‑PROCESS (strip prefix & prompt)
         # ---------------
-        # We want only tokens *after* the user‑supplied prompt, not the prefix.
+        ## Only return new tokens after input prompt
         generated_texts = []
         for seq, prompt in zip(outputs, prompts):
-            # Convert to list[int], drop bos if present
+            ## Convert to list[int], drop bos if present
             seq = seq.tolist()
             if seq and seq[0] == self.processor.tokenizer.bos_token_id:
                 seq = seq[1:]
 
-            # Decode everything, then remove the original prompt
+            ## Decode everything, then remove the original prompt
             decoded = self.processor.tokenizer.decode(seq, skip_special_tokens=True)
             generated_texts.append(decoded[len(prompt):].lstrip())
 
-        # Clean cache
+        ## Clean cache
         del self._cached_v_tokens
         for block in self.cross_attn_blocks.values():
             block.v_tokens = None
