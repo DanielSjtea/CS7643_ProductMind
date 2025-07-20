@@ -1,0 +1,8 @@
+torch>=1.10.0
+torchvision>=0.11.0
+transformers>=4.25.0
+pillow>=9.0.0
+tqdm>=4.62.0
+numpy>=1.20.0
+# Optional dependencies
+# open_flamingo  # Uncomment to install open_flamingo for HybridBlip2Flamingo model
